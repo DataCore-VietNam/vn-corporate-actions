@@ -243,3 +243,166 @@ def test_missing_columns_raises() -> None:
     df = pd.DataFrame({"ticker": ["VNM"], "trade_date": [date(2023, 1, 1)]})
     with pytest.raises(KeyError):
         adj.adjust_prices(df)
+
+
+# ----------------------------------------------------------------------
+# Additional action types
+# ----------------------------------------------------------------------
+
+
+def test_special_cash_dividend() -> None:
+    """Special cash dividend behaves like a regular cash dividend."""
+    df = pd.DataFrame(
+        {
+            "ticker": ["VNM", "VNM"],
+            "trade_date": [date(2024, 6, 11), date(2024, 6, 12)],
+            "close": [70_000.0, 62_000.0],
+        }
+    )
+    adj = Adjuster()
+    adj.add_special_cash_dividend("VNM", "2024-06-12", amount=8_000)
+
+    out = adj.adjust_prices(df)
+    pre = out.loc[out["trade_date"] == date(2024, 6, 11), "close"].iloc[0]
+    assert pre == pytest.approx(70_000.0 * (62_000.0 / 70_000.0))
+
+
+def test_return_of_capital() -> None:
+    """Return of capital lowers pre-ex prices like a cash dividend."""
+    df = pd.DataFrame(
+        {
+            "ticker": ["VNM", "VNM"],
+            "trade_date": [date(2024, 6, 11), date(2024, 6, 12)],
+            "close": [70_000.0, 67_000.0],
+        }
+    )
+    adj = Adjuster()
+    adj.add_return_of_capital("VNM", "2024-06-12", amount=3_000)
+
+    out = adj.adjust_prices(df)
+    pre = out.loc[out["trade_date"] == date(2024, 6, 11), "close"].iloc[0]
+    assert pre == pytest.approx(70_000.0 * (67_000.0 / 70_000.0))
+
+
+def test_spinoff() -> None:
+    """Spin-off drops parent price by distributed value per share."""
+    df = pd.DataFrame(
+        {
+            "ticker": ["VIC", "VIC"],
+            "trade_date": [date(2024, 3, 31), date(2024, 4, 1)],
+            "close": [50_000.0, 38_000.0],
+        }
+    )
+    adj = Adjuster()
+    adj.add_spinoff("VIC", "2024-04-01", value_per_share=12_000)
+
+    out = adj.adjust_prices(df)
+    pre = out.loc[out["trade_date"] == date(2024, 3, 31), "close"].iloc[0]
+    assert pre == pytest.approx(50_000.0 * ((50_000.0 - 12_000.0) / 50_000.0))
+
+
+def test_par_value_change() -> None:
+    """Halving par doubles shares: pre-ex price halved, volume doubled."""
+    df = pd.DataFrame(
+        {
+            "ticker": ["VNM", "VNM"],
+            "trade_date": [date(2024, 2, 29), date(2024, 3, 1)],
+            "close": [100_000.0, 50_000.0],
+            "volume": [1_000.0, 2_000.0],
+        }
+    )
+    adj = Adjuster()
+    adj.add_par_value_change("VNM", "2024-03-01", old_par=10_000, new_par=5_000)
+
+    out = adj.adjust_prices(df, volume_col="volume")
+    pre_price = out.loc[out["trade_date"] == date(2024, 2, 29), "close"].iloc[0]
+    pre_vol = out.loc[out["trade_date"] == date(2024, 2, 29), "volume"].iloc[0]
+    assert pre_price == pytest.approx(50_000.0)
+    assert pre_vol == pytest.approx(2_000.0)
+
+
+def test_esop_issuance() -> None:
+    """ESOP issuance dilutes like a rights issue (TERP)."""
+    df = pd.DataFrame(
+        {
+            "ticker": ["FPT", "FPT"],
+            "trade_date": [date(2024, 1, 31), date(2024, 2, 1)],
+            "close": [100_000.0, 95_714.29],
+            "volume": [1_000.0, 1_050.0],
+        }
+    )
+    adj = Adjuster()
+    adj.add_esop_issuance("FPT", "2024-02-01", ratio=0.05, issue_price=10_000)
+
+    out = adj.adjust_prices(df, volume_col="volume")
+    pre_price = out.loc[out["trade_date"] == date(2024, 1, 31), "close"].iloc[0]
+    pre_vol = out.loc[out["trade_date"] == date(2024, 1, 31), "volume"].iloc[0]
+    theoretical = (100_000.0 + 0.05 * 10_000.0) / 1.05
+    assert pre_price == pytest.approx(theoretical, rel=1e-6)
+    assert pre_vol == pytest.approx(1_000.0 * 1.05)
+
+
+def test_esop_free_grant() -> None:
+    """A free ESOP grant (issue_price=0) is equivalent to a stock dividend."""
+    df = pd.DataFrame(
+        {
+            "ticker": ["FPT", "FPT"],
+            "trade_date": [date(2024, 1, 31), date(2024, 2, 1)],
+            "close": [105_000.0, 100_000.0],
+        }
+    )
+    adj = Adjuster()
+    adj.add_esop_issuance("FPT", "2024-02-01", ratio=0.05, issue_price=0)
+
+    out = adj.adjust_prices(df)
+    pre = out.loc[out["trade_date"] == date(2024, 1, 31), "close"].iloc[0]
+    assert pre == pytest.approx(105_000.0 / 1.05)
+
+
+def test_ticker_change_is_price_neutral() -> None:
+    """Ticker change leaves prices and volumes untouched."""
+    df = pd.DataFrame(
+        {
+            "ticker": ["MSN", "MSN"],
+            "trade_date": [date(2022, 12, 31), date(2023, 1, 1)],
+            "close": [80_000.0, 81_000.0],
+            "volume": [1_000.0, 1_100.0],
+        }
+    )
+    adj = Adjuster()
+    adj.add_ticker_change("MSN", "2023-01-01", new_ticker="MSN2")
+
+    out = adj.adjust_prices(df, volume_col="volume")
+    pd.testing.assert_frame_equal(out, df)
+
+
+def test_cash_then_spinoff_stacking() -> None:
+    """Cash dividend and spin-off on different dates compound correctly."""
+    df = pd.DataFrame(
+        {
+            "ticker": ["VIC"] * 3,
+            "trade_date": [date(2024, 3, 31), date(2024, 4, 1), date(2024, 6, 12)],
+            "close": [50_000.0, 38_000.0, 40_000.0],
+        }
+    )
+    adj = Adjuster()
+    adj.add_spinoff("VIC", "2024-04-01", value_per_share=12_000)
+    adj.add_cash_dividend("VIC", "2024-06-12", amount=2_000)
+
+    out = adj.adjust_prices(df)
+    closes = out.set_index("trade_date")["close"]
+    spin_factor = (50_000.0 - 12_000.0) / 50_000.0
+    # prior close before the cash dividend is 38,000.
+    cash_factor = (38_000.0 - 2_000.0) / 38_000.0
+    assert closes[date(2024, 3, 31)] == pytest.approx(50_000.0 * spin_factor * cash_factor)
+    assert closes[date(2024, 4, 1)] == pytest.approx(38_000.0 * cash_factor)
+    assert closes[date(2024, 6, 12)] == pytest.approx(40_000.0)
+
+
+def test_len_and_iter_cover_all_tickers() -> None:
+    adj = Adjuster()
+    adj.add_split("VNM", "2023-08-15", ratio=2.0)
+    adj.add_bonus_issue("HPG", "2023-07-20", ratio=0.20)
+    assert len(adj) == 2
+    assert sorted(a.ticker for a in adj) == ["HPG", "VNM"]
+    assert adj.tickers() == ["HPG", "VNM"]

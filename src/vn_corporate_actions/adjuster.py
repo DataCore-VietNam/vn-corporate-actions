@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterator, Sequence
 from datetime import date, datetime
 
 import numpy as np
@@ -13,24 +13,58 @@ from vn_corporate_actions.actions import (
     Action,
     BonusIssue,
     CashDividend,
+    ESOPIssuance,
+    ParValueChange,
+    ReturnOfCapital,
     ReverseSplit,
     RightsIssue,
+    SpecialCashDividend,
+    Spinoff,
     Split,
     StockDividend,
+    TickerChange,
+)
+
+# Actions whose backward factor depends on the close immediately before ex-date.
+_NEEDS_PRIOR_CLOSE = (
+    CashDividend,
+    SpecialCashDividend,
+    ReturnOfCapital,
+    Spinoff,
+    RightsIssue,
+    ESOPIssuance,
 )
 
 
 def _to_date(value: str | date | datetime | pd.Timestamp) -> date:
     """Coerce common date-ish inputs to :class:`datetime.date`."""
-    if isinstance(value, date) and not isinstance(value, datetime):
-        return value
-    if isinstance(value, datetime):
-        return value.date()
     if isinstance(value, pd.Timestamp):
         return value.date()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
     if isinstance(value, str):
         return datetime.strptime(value, "%Y-%m-%d").date()
     raise TypeError(f"Cannot coerce {value!r} ({type(value).__name__}) to a date.")
+
+
+def _cash_outflow(action: Action) -> float | None:
+    """Per-share cash amount that lowers the price, if this is a cash action."""
+    if isinstance(action, (CashDividend, SpecialCashDividend, ReturnOfCapital)):
+        return action.amount
+    if isinstance(action, Spinoff):
+        return action.value_per_share
+    return None
+
+
+def _dilution(action: Action) -> tuple[float, float] | None:
+    """``(ratio, issue_price)`` for dilution actions, else ``None``."""
+    if isinstance(action, RightsIssue):
+        return action.ratio, action.subscription_price
+    if isinstance(action, ESOPIssuance):
+        return action.ratio, action.issue_price
+    return None
 
 
 class Adjuster:
@@ -68,10 +102,6 @@ class Adjuster:
         """Register a reverse split (e.g. ``ratio=2.0`` for 2:1)."""
         self.add(ReverseSplit(ticker=ticker, ex_date=_to_date(ex_date), ratio=ratio))
 
-    def add_cash_dividend(self, ticker: str, ex_date: str | date, amount: float) -> None:
-        """Register a cash dividend (VND per share)."""
-        self.add(CashDividend(ticker=ticker, ex_date=_to_date(ex_date), amount=amount))
-
     def add_stock_dividend(self, ticker: str, ex_date: str | date, ratio: float) -> None:
         """Register a stock dividend (e.g. ``ratio=0.10`` for 10%)."""
         self.add(StockDividend(ticker=ticker, ex_date=_to_date(ex_date), ratio=ratio))
@@ -79,6 +109,32 @@ class Adjuster:
     def add_bonus_issue(self, ticker: str, ex_date: str | date, ratio: float) -> None:
         """Register a bonus share issue (e.g. ``ratio=0.20`` for 20%)."""
         self.add(BonusIssue(ticker=ticker, ex_date=_to_date(ex_date), ratio=ratio))
+
+    def add_par_value_change(
+        self, ticker: str, ex_date: str | date, old_par: float, new_par: float
+    ) -> None:
+        """Register a par-value redenomination (e.g. 10000 -> 5000)."""
+        self.add(
+            ParValueChange(
+                ticker=ticker, ex_date=_to_date(ex_date), old_par=old_par, new_par=new_par
+            )
+        )
+
+    def add_cash_dividend(self, ticker: str, ex_date: str | date, amount: float) -> None:
+        """Register a cash dividend (VND per share)."""
+        self.add(CashDividend(ticker=ticker, ex_date=_to_date(ex_date), amount=amount))
+
+    def add_special_cash_dividend(self, ticker: str, ex_date: str | date, amount: float) -> None:
+        """Register a special / one-off cash dividend (VND per share)."""
+        self.add(SpecialCashDividend(ticker=ticker, ex_date=_to_date(ex_date), amount=amount))
+
+    def add_return_of_capital(self, ticker: str, ex_date: str | date, amount: float) -> None:
+        """Register a cash return of capital (VND per share)."""
+        self.add(ReturnOfCapital(ticker=ticker, ex_date=_to_date(ex_date), amount=amount))
+
+    def add_spinoff(self, ticker: str, ex_date: str | date, value_per_share: float) -> None:
+        """Register a spin-off / demerger (distributed value in VND per share)."""
+        self.add(Spinoff(ticker=ticker, ex_date=_to_date(ex_date), value_per_share=value_per_share))
 
     def add_rights_issue(
         self,
@@ -96,6 +152,27 @@ class Adjuster:
                 subscription_price=subscription_price,
             )
         )
+
+    def add_esop_issuance(
+        self,
+        ticker: str,
+        ex_date: str | date,
+        ratio: float,
+        issue_price: float,
+    ) -> None:
+        """Register an ESOP issuance at ``issue_price`` (VND, 0 for free grant)."""
+        self.add(
+            ESOPIssuance(
+                ticker=ticker,
+                ex_date=_to_date(ex_date),
+                ratio=ratio,
+                issue_price=issue_price,
+            )
+        )
+
+    def add_ticker_change(self, ticker: str, ex_date: str | date, new_ticker: str) -> None:
+        """Register a ticker/symbol change (metadata only, no price effect)."""
+        self.add(TickerChange(ticker=ticker, ex_date=_to_date(ex_date), new_ticker=new_ticker))
 
     # ------------------------------------------------------------------
     # Query
@@ -120,29 +197,34 @@ class Adjuster:
     ) -> float:
         """Compute the per-action backward multiplier applied to dates < ex.
 
-        Returns the *price* factor; volume scaling is the reciprocal for
-        share-count actions and 1.0 for cash dividends.
+        Returns the *price* factor; volume scaling is handled separately.
         """
         if isinstance(action, Split):
             return 1.0 / action.ratio
         if isinstance(action, ReverseSplit):
             return action.ratio
-        if isinstance(action, StockDividend):
+        if isinstance(action, (StockDividend, BonusIssue)):
             return 1.0 / (1.0 + action.ratio)
-        if isinstance(action, BonusIssue):
-            return 1.0 / (1.0 + action.ratio)
-        if isinstance(action, CashDividend):
+        if isinstance(action, ParValueChange):
+            return action.new_par / action.old_par
+        if isinstance(action, TickerChange):
+            return 1.0
+
+        cash = _cash_outflow(action)
+        if cash is not None:
             if prior_close is None or prior_close <= 0:
-                # No reference close available — skip rather than divide by zero.
+                # No reference close available -- skip rather than divide by zero.
                 return 1.0
-            return (prior_close - action.amount) / prior_close
-        if isinstance(action, RightsIssue):
+            return (prior_close - cash) / prior_close
+
+        dilution = _dilution(action)
+        if dilution is not None:
+            ratio, issue_price = dilution
             if prior_close is None or prior_close <= 0:
                 return 1.0
-            theoretical = (prior_close + action.ratio * action.subscription_price) / (
-                1.0 + action.ratio
-            )
+            theoretical = (prior_close + ratio * issue_price) / (1.0 + ratio)
             return theoretical / prior_close
+
         raise TypeError(f"Unknown action type: {type(action).__name__}")
 
     @staticmethod
@@ -152,10 +234,17 @@ class Adjuster:
             return action.ratio
         if isinstance(action, ReverseSplit):
             return 1.0 / action.ratio
-        if isinstance(action, (StockDividend, BonusIssue, RightsIssue)):
-            ratio = action.ratio  # type: ignore[attr-defined]
-            return 1.0 + ratio
-        if isinstance(action, CashDividend):
+        if isinstance(action, (StockDividend, BonusIssue)):
+            return 1.0 + action.ratio
+        if isinstance(action, (RightsIssue, ESOPIssuance)):
+            return 1.0 + action.ratio
+        if isinstance(action, ParValueChange):
+            return action.old_par / action.new_par
+        # Cash dividends, spin-offs and ticker changes do not change share count.
+        if isinstance(
+            action,
+            (CashDividend, SpecialCashDividend, ReturnOfCapital, Spinoff, TickerChange),
+        ):
             return 1.0
         raise TypeError(f"Unknown action type: {type(action).__name__}")
 
@@ -173,8 +262,8 @@ class Adjuster:
         most recent ex-date, the factor is ``1.0``.
 
         ``prior_closes`` maps ex-date to the close on the trading day
-        immediately before — required for accurate cash-dividend and
-        rights-issue factors. Other action types ignore it.
+        immediately before -- required for accurate cash-dividend, spin-off
+        and rights/ESOP factors. Other action types ignore it.
         """
         target = _to_date(on_date)
         prior_closes = prior_closes or {}
@@ -277,17 +366,16 @@ class Adjuster:
     ) -> dict[date, float]:
         """Look up the close on the trading day immediately before each ex-date.
 
-        Used for cash dividends and rights issues. Returns an empty mapping
-        if no such close is available (e.g. the ex-date precedes the data).
+        Used for cash dividends, spin-offs and rights/ESOP issues. Returns
+        an empty mapping if no such close is available (e.g. the ex-date
+        precedes the data).
         """
         actions = self.actions_for(ticker)
-        needs_prior = [
-            a for a in actions if isinstance(a, (CashDividend, RightsIssue))
-        ]
+        needs_prior = [a for a in actions if isinstance(a, _NEEDS_PRIOR_CLOSE)]
         if not needs_prior:
             return {}
 
-        order = np.argsort(dates)
+        order = sorted(range(len(dates)), key=lambda i: dates[i])
         sorted_dates = [dates[i] for i in order]
         sorted_prices = prices[order]
 
@@ -311,7 +399,7 @@ class Adjuster:
     def __len__(self) -> int:
         return sum(len(v) for v in self._actions.values())
 
-    def __iter__(self) -> Iterable[Action]:
+    def __iter__(self) -> Iterator[Action]:
         for ticker in sorted(self._actions):
             yield from self.actions_for(ticker)
 

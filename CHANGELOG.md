@@ -8,3 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Initial release. Adjuster for Split / ReverseSplit / CashDividend / StockDividend / BonusIssue / RightsIssue. Backward-adjusted prices and volumes. Multi-action stacking. DataFrame integration. 25 tests.
 
 [0.1.0]: https://github.com/DataCore-VietNam/vn-corporate-actions/releases/tag/v0.1.0
+
+## [0.2.0] - 2026-06-05
+
+Added six corporate-action types for fuller coverage of Vietnamese equities:
+`special_cash_dividend`, `return_of_capital`, `spinoff`, `par_value_change`,
+`esop_issuance`, and `ticker_change`. Each ships with a convenience helper on
+`Adjuster`, backward price/volume math, and tests (47 total). Also: added a
+mypy configuration plus `pandas-stubs`, fixed the `Adjuster.__iter__` return
+annotation, tightened ticker validation, and cleaned up formatting so the type
+check and formatter both run clean.
+
+[0.2.0]: https://github.com/DataCore-VietNam/vn-corporate-actions/releases/tag/v0.2.0
