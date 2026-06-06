@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vn-corporate-actions"
-version = "0.2.0"
+version = "0.3.0"
 description = "Vietnamese equity corporate actions: splits, dividends, bonus issues, rights — with backwards-adjusted price series."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -18,7 +18,7 @@ from vn_corporate_actions.actions import (
 )
 from vn_corporate_actions.adjuster import Adjuster
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Adjuster",
